@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Extra logging related to initialization of Log4j.
+ Set to debug or trace if log4j initialization is failing. -->
+<Configuration status="warn">
+    <Appenders>
+        <!-- Console appender configuration -->
+        <Console name="console" target="SYSTEM_OUT">
+            <!-- Used color codes to make the output more readable -->
+            <PatternLayout
+                    pattern="%highlight{%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n}{FATAL=red, ERROR=red, WARN=yellow, INFO=green, DEBUG=blue, TRACE=white}"/>
+
+        </Console>
+    </Appenders>
+    <Loggers>
+        <!-- Root logger referring to console appender -->
+        <Root level="info" additivity="false">
+            <AppenderRef ref="console"/>
+        </Root>
+    </Loggers>
+</Configuration>
