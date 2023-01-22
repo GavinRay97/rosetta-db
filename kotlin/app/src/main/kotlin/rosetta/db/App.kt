@@ -169,6 +169,70 @@ object DiskManager : IDiskManager {
     }
 }
 
+
+// Eviction policy interface for the buffer pool
+// Has callback methods for when a page is pinned or unpinned
+// The eviction policy should implement the logic for which page to evict
+interface IEvictionPolicy {
+    fun pagePinned(pageId: Int)
+    fun pageUnpinned(pageId: Int)
+    fun evictPage(): Int
+}
+
+// LRU eviction policy
+class LRUEvictionPolicy : IEvictionPolicy {
+    private val logger = KotlinLogging.logger {}
+
+    private val pageIds = ArrayDeque<Int>()
+
+    override fun pagePinned(pageId: Int) {
+        logger.info { "Page $pageId pinned" }
+        pageIds.remove(pageId)
+        pageIds.addLast(pageId)
+    }
+
+    override fun pageUnpinned(pageId: Int) {
+        logger.info { "Page $pageId unpinned" }
+        pageIds.remove(pageId)
+        pageIds.addFirst(pageId)
+    }
+
+    override fun evictPage(): Int {
+        logger.info { "Evicting page" }
+        return pageIds.removeFirst()
+    }
+}
+
+class ClockEvictionPolicy : IEvictionPolicy {
+    private val logger = KotlinLogging.logger {}
+
+    private var clockHand = 0
+    private val refBit = BooleanArray(BUFFER_POOL_PAGES)
+
+    override fun pagePinned(pageId: Int) {
+        logger.info { "Page $pageId pinned" }
+        refBit[pageId] = true
+    }
+
+    override fun pageUnpinned(pageId: Int) {
+        logger.info { "Page $pageId unpinned" }
+        refBit[pageId] = false
+    }
+
+    override fun evictPage(): Int {
+        logger.info { "Evicting page" }
+        while (true) {
+            if (!refBit[clockHand]) {
+                val pageId = clockHand
+                clockHand = (clockHand + 1) % BUFFER_POOL_PAGES
+                return pageId
+            }
+            refBit[clockHand] = false
+            clockHand = (clockHand + 1) % BUFFER_POOL_PAGES
+        }
+    }
+}
+
 interface IBufferPool {
     fun fetchPage(pageLocation: PageLocation): MemorySegment
     fun unpinPage(pageLocation: PageLocation, isDirty: Boolean)
@@ -194,7 +258,10 @@ fun <T> ReentrantReadWriteLock.withWriteLock(action: () -> T): T {
     }
 }
 
-class BufferPool : IBufferPool {
+class BufferPool(
+    private val diskManager: IDiskManager,
+    private val evictionPolicy: IEvictionPolicy
+) : IBufferPool {
     private val logger = KotlinLogging.logger {}
 
     private val bufferPool: MemorySegment
@@ -213,6 +280,18 @@ class BufferPool : IBufferPool {
         freeList = ArrayDeque((0 until BUFFER_POOL_PAGES).toList())
     }
 
+    private fun pinPage(pageLocation: PageLocation) {
+        logger.info { "Pinning page $pageLocation" }
+        val pageId = pageTableRwLock.withReadLock {
+            pageTable[pageLocation]
+        }
+        if (pageId != null) {
+            pinCount[pageId]++
+            refBit[pageId] = true
+            evictionPolicy.pagePinned(pageId)
+        }
+    }
+
     override fun fetchPage(pageLocation: PageLocation): MemorySegment {
         logger.info { "Fetching page $pageLocation" }
         // First, check if the page is already in the buffer pool
@@ -220,41 +299,25 @@ class BufferPool : IBufferPool {
             pageTable[pageLocation]
         }
         if (pageId != null) {
-            pinCount[pageId]++
-            refBit[pageId] = true
+            pinPage(pageLocation)
             return pages[pageId]
         }
         // If the page is not in the buffer pool, we need to evict a page
         val evictedPageId = evictPage()
         // Then, we need to read the page from disk
-        DiskManager.readPage(pageLocation, pages[evictedPageId])
+        diskManager.readPage(pageLocation, pages[evictedPageId])
         // Finally, we need to update the page table
         pageTableRwLock.withWriteLock {
             pageTable[pageLocation] = evictedPageId
         }
-        pinCount[evictedPageId] = 1
         isDirty[evictedPageId] = false
-        refBit[evictedPageId] = true
+        pinPage(pageLocation)
         return pages[evictedPageId]
     }
 
     private fun evictPage(): Int {
         logger.info { "Evicting page" }
-        while (true) {
-            val pageId = freeList.removeFirst()
-            if (pinCount[pageId] == 0) {
-                if (isDirty[pageId]) {
-                    val pageLocation = pageTableRwLock.withReadLock {
-                        pageTable.entries.find { it.value == pageId }!!.key
-                    }
-                    DiskManager.writePage(pageLocation, pages[pageId])
-                    isDirty[pageId] = false
-                }
-                return pageId
-            }
-            freeList.addLast(pageId)
-            refBit[pageId] = false
-        }
+        return evictionPolicy.evictPage()
     }
 
     override fun unpinPage(pageLocation: PageLocation, isDirty: Boolean) {
@@ -262,19 +325,23 @@ class BufferPool : IBufferPool {
         val pageId = pageTableRwLock.withReadLock { pageTable[pageLocation] }!!
         pinCount[pageId]--
         this.isDirty[pageId] = this.isDirty[pageId] || isDirty
+        evictionPolicy.pageUnpinned(pageId)
+        refBit[pageId] = true
     }
 
     override fun flushPage(pageLocation: PageLocation) {
         logger.info { "Flushing page $pageLocation" }
         val pageId = pageTableRwLock.withReadLock { pageTable[pageLocation] }!!
         if (isDirty[pageId]) {
-            DiskManager.writePage(pageLocation, pages[pageId])
+            diskManager.writePage(pageLocation, pages[pageId])
             isDirty[pageId] = false
         }
 
         freeList.addLast(pageId)
         pageTable.remove(pageLocation)
 
+        // We don't call "evictionPolicy.pageUnpinned(pageId)" here because we are evicting the page
+        // and not unpinning it
         pinCount[pageId] = 0
         isDirty[pageId] = false
         refBit[pageId] = false
@@ -287,6 +354,7 @@ class BufferPool : IBufferPool {
         }
     }
 }
+
 
 // Accessor Methods for Heap Page memory layout
 object HeapPage {
@@ -513,7 +581,7 @@ class HeapFile(
 }
 
 fun bufferPoolTest() {
-    val bufferPool = BufferPool()
+    val bufferPool = BufferPool(diskManager = DiskManager, evictionPolicy = ClockEvictionPolicy())
     val pageLocation = PageLocation(1, 2, 3)
 
     val page = bufferPool.fetchPage(pageLocation)
@@ -527,7 +595,7 @@ fun bufferPoolTest() {
 }
 
 fun heapPageTest() {
-    val bufferPool = BufferPool()
+    val bufferPool = BufferPool(diskManager = DiskManager, evictionPolicy = ClockEvictionPolicy())
     val pageLocation = PageLocation(1, 2, 3)
 
     val page = bufferPool.fetchPage(pageLocation)
@@ -547,7 +615,7 @@ fun heapPageTest() {
 }
 
 fun heapFileTest() {
-    val bufferPool = BufferPool()
+    val bufferPool = BufferPool(diskManager = DiskManager, evictionPolicy = ClockEvictionPolicy())
 
     val tuple = MemorySegment.allocateNative(4, MemorySession.global())
     tuple.asByteBuffer().putInt(0, 42)

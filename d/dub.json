@@ -1,0 +1,10 @@
+{
+	"authors": [
+		"user"
+	],
+	"copyright": "Copyright © 2022, user",
+	"description": "A minimal D application.",
+	"license": "proprietary",
+	"name": "bustub-dlang",
+	"dflags": []
+}
