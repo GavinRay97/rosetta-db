@@ -1,0 +1,138 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 23,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default Config",
+      "description": "Default build using Ninja generator",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/default",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_COLOR_DIAGNOSTICS": "ON",
+        "CMAKE_C_STANDARD": "23",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_CXX_EXTENSIONS": "ON",
+        "CMAKE_CXX_STANDARD_REQUIRED": "OFF",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_C_COMPILER_LAUNCHER": "ccache",
+        "CMAKE_LINK_WHAT_YOU_USE": "ON"
+      },
+      "environment": {
+        "COMMON_DEFINES": "-D_GLIBCXX_ASSERTIONS -D_GLIBCXX_CONCEPT_CHECKS -D_GLIBCXX_USE_CHAR8_T -D__USE_GNU",
+        "COMMON_CXX_FLAGS": "$env{COMMON_DEFINES} -Wall -Wextra -Werror -Wno-unused-variable -pipe -ftrivial-auto-var-init=zero -fPIC",
+        "DEBUG_DEFINES": "-DDEBUG -D_GLIBCXX_DEBUG",
+        "DEBUG_CXX_FLAGS": "$env{DEBUG_DEFINES} -O0 -g -ggdb3 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fstandalone-debug",
+        "RELEASE_DEFINES": "-D_FORTIFY_SOURCE=3",
+        "RELEASE_CXX_FLAGS": "$env{RELEASE_DEFINES} -Ofast -march=native -mtune=native -flto",
+        "COMMON_SANITIZER_DEFINES": "-D_GLIBCXX_SANITIZE_STD_ALLOCATOR -D_GLIBCXX_SANITIZE_VECTOR",
+        "COMMON_SANITIZER_FLAGS": "$env{COMMON_SANITIZER_DEFINES} -fsanitize=address,undefined -fsanitize-address-use-after-scope",
+        "GCC_LINKER_FLAGS": "-Wl,-rpath='/opt/gcc-latest/lib64' -Wl,-rpath='/opt/gcc-latest/lib'",
+        "GCC_SANITIZER_FLAGS": "$env{COMMON_SANITIZER_FLAGS}",
+        "LLVM_SANITIZER_FLAGS": "$env{COMMON_SANITIZER_FLAGS} -fsanitize=function,integer,nullability",
+        "CLANG_ONLY_CXX_FLAGS": "-Wthread-safety -Wthread-safety-beta -Wthread-safety-verbose --gcc-toolchain=/opt/gcc-latest -Warray-bounds-pointer-arithmetic -Wbind-to-temporary-copy -Wcalled-once-parameter -Wcast-align -Wconditional-uninitialized -Wconsumed -Wcovered-switch-default -Wexplicit-ownership-type -Wheader-hygiene -Widiomatic-parentheses -Wloop-analysis -Wmain -Wmethod-signatures -Wmissing-noreturn -Wmissing-variable-declarations -Wnarrowing -Wnon-gcc -Wnullable-to-nonnull-conversion -Wover-aligned -Woverriding-method-mismatch -Wpacked -Wpadded -Wpartial-availability -Wstatic-in-inline -Wsuggest-destructor-override -Wsuggest-override -Wsuper-class-method-mismatch -Wtautological-constant-in-range-compare -Wunaligned-access -Wundefined-func-template -Wunreachable-code-aggressive -Wunused-member-function -Wunused-template -Wno-padded -Wno-sign-conversion -Wno-implicit-int-float-conversion"
+      },
+      "vendor": {}
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug Build",
+      "description": "Debug build using Ninja generator",
+      "generator": "Ninja",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "$env{COMMON_CXX_FLAGS} $env{DEBUG_CXX_FLAGS}",
+        "CMAKE_CXX_FLAGS": "$env{COMMON_CXX_FLAGS} $env{DEBUG_CXX_FLAGS}"
+      }
+    },
+    {
+      "name": "debug-gcc-fanalyzer",
+      "displayName": "Debug GCC with -fanalyzer",
+      "description": "Debug build with GCC and -fanalyzer",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "/opt/gcc-latest/bin/gcc",
+        "CMAKE_CXX_COMPILER": "/opt/gcc-latest/bin/g++",
+        "CMAKE_C_FLAGS": "$env{COMMON_CXX_FLAGS} $env{DEBUG_CXX_FLAGS} $env{COMMON_SANITIZER_FLAGS} -fanalyzer",
+        "CMAKE_CXX_FLAGS": "$env{COMMON_CXX_FLAGS} $env{DEBUG_CXX_FLAGS} $env{COMMON_SANITIZER_FLAGS} -fanalyzer"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release Build",
+      "description": "Release build using Ninja generator",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "$env{COMMON_CXX_FLAGS} $env{RELEASE_C_FLAGS}",
+        "CMAKE_CXX_FLAGS": "$env{COMMON_CXX_FLAGS} $env{RELEASE_CXX_FLAGS}"
+      }
+    },
+    {
+      "name": "sanitize-llvm",
+      "displayName": "Sanitize Build",
+      "description": "Sanitize build using Ninja generator",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/sanitize-llvm",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "/home/user/projects/llvm-project/build/bin/clang-16",
+        "CMAKE_CXX_COMPILER": "/home/user/projects/llvm-project/build/bin/clang++",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld $env{LLVM_SANITIZER_FLAGS}",
+        "CMAKE_MODULE_LINKER_FLAGS": "-fuse-ld=lld $env{LLVM_SANITIZER_FLAGS}",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld $env{LLVM_SANITIZER_FLAGS}"
+      },
+      "environment": {
+        "CXX_FLAGS": "$env{COMMON_CXX_FLAGS} $env{DEBUG_CXX_FLAGS} $env{LLVM_SANITIZER_FLAGS} $env{CLANG_ONLY_CXX_FLAGS}"
+      }
+    },
+    {
+      "name": "sanitize-gcc",
+      "displayName": "Sanitize Build with GCC",
+      "description": "Sanitize build using Ninja generator and GCC",
+      "inherits": "default",
+      "binaryDir": "${sourceDir}/build/sanitize-gcc",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "/opt/gcc-latest/bin/gcc",
+        "CMAKE_CXX_COMPILER": "/opt/gcc-latest/bin/g++",
+        "CMAKE_EXE_LINKER_FLAGS": "$env{GCC_LINKER_FLAGS} $env{GCC_SANITIZER_FLAGS}",
+        "CMAKE_MODULE_LINKER_FLAGS": "$env{GCC_LINKER_FLAGS} $env{GCC_SANITIZER_FLAGS}",
+        "CMAKE_SHARED_LINKER_FLAGS": "$env{GCC_LINKER_FLAGS} $env{GCC_SANITIZER_FLAGS}"
+      },
+      "environment": {
+        "CXX_FLAGS": "$env{COMMON_CXX_FLAGS} $env{DEBUG_CXX_FLAGS} $env{GCC_SANITIZER_FLAGS} -Og"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error",
+        "stopOnFailure": true
+      }
+    }
+  ],
+  "vendor": {}
+}
