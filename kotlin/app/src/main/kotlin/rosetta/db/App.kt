@@ -14,6 +14,7 @@ import java.nio.file.OpenOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 const val PAGE_SIZE = 4096
 const val BUFFER_POOL_PAGES = 1000
@@ -175,56 +176,97 @@ interface IBufferPool {
     fun flushAllPages(dbId: Int)
 }
 
+fun <T> ReentrantReadWriteLock.withReadLock(action: () -> T): T {
+    this.readLock().lock()
+    try {
+        return action()
+    } finally {
+        this.readLock().unlock()
+    }
+}
+
+fun <T> ReentrantReadWriteLock.withWriteLock(action: () -> T): T {
+    this.writeLock().lock()
+    try {
+        return action()
+    } finally {
+        this.writeLock().unlock()
+    }
+}
+
 class BufferPool : IBufferPool {
     private val logger = KotlinLogging.logger {}
 
     private val bufferPool: MemorySegment
     private val pages: Array<MemorySegment>
     private val freeList: ArrayDeque<Int>
-    private val pinCount: IntArray
-    private val isDirty: BooleanArray
-    private val refBit: BooleanArray
-    private val pageTable: ConcurrentHashMap<PageLocation, Int>
+
+    private val pinCount = IntArray(BUFFER_POOL_PAGES)
+    private val isDirty = BooleanArray(BUFFER_POOL_PAGES)
+    private val refBit = BooleanArray(BUFFER_POOL_PAGES)
+    private val pageTable = HashMap<PageLocation, Int>()
+    private val pageTableRwLock = ReentrantReadWriteLock()
 
     init {
         bufferPool = MemorySegment.allocateNative(PAGE_SIZE * BUFFER_POOL_PAGES.toLong(), MemorySession.global())
         pages = Array(BUFFER_POOL_PAGES) { bufferPool.asSlice((it * PAGE_SIZE).toLong(), PAGE_SIZE.toLong()) }
         freeList = ArrayDeque((0 until BUFFER_POOL_PAGES).toList())
-
-        isDirty = BooleanArray(BUFFER_POOL_PAGES)
-        refBit = BooleanArray(BUFFER_POOL_PAGES)
-        pinCount = IntArray(BUFFER_POOL_PAGES)
-
-        pageTable = ConcurrentHashMap()
     }
 
     override fun fetchPage(pageLocation: PageLocation): MemorySegment {
         logger.info { "Fetching page $pageLocation" }
-        val pageId = pageTable[pageLocation]
+        // First, check if the page is already in the buffer pool
+        val pageId = pageTableRwLock.withReadLock {
+            pageTable[pageLocation]
+        }
         if (pageId != null) {
             pinCount[pageId]++
             refBit[pageId] = true
             return pages[pageId]
         }
+        // If the page is not in the buffer pool, we need to evict a page
+        val evictedPageId = evictPage()
+        // Then, we need to read the page from disk
+        DiskManager.readPage(pageLocation, pages[evictedPageId])
+        // Finally, we need to update the page table
+        pageTableRwLock.withWriteLock {
+            pageTable[pageLocation] = evictedPageId
+        }
+        pinCount[evictedPageId] = 1
+        isDirty[evictedPageId] = false
+        refBit[evictedPageId] = true
+        return pages[evictedPageId]
+    }
 
-        val freePageId = freeList.removeFirst()
-        DiskManager.readPage(pageLocation, pages[freePageId])
-        pinCount[freePageId]++
-        refBit[freePageId] = true
-        pageTable[pageLocation] = freePageId
-        return pages[freePageId]
+    private fun evictPage(): Int {
+        logger.info { "Evicting page" }
+        while (true) {
+            val pageId = freeList.removeFirst()
+            if (pinCount[pageId] == 0) {
+                if (isDirty[pageId]) {
+                    val pageLocation = pageTableRwLock.withReadLock {
+                        pageTable.entries.find { it.value == pageId }!!.key
+                    }
+                    DiskManager.writePage(pageLocation, pages[pageId])
+                    isDirty[pageId] = false
+                }
+                return pageId
+            }
+            freeList.addLast(pageId)
+            refBit[pageId] = false
+        }
     }
 
     override fun unpinPage(pageLocation: PageLocation, isDirty: Boolean) {
         logger.info { "Unpinning page $pageLocation" }
-        val pageId = pageTable[pageLocation]!!
+        val pageId = pageTableRwLock.withReadLock { pageTable[pageLocation] }!!
         pinCount[pageId]--
-        this.isDirty[pageId] = isDirty
+        this.isDirty[pageId] = this.isDirty[pageId] || isDirty
     }
 
     override fun flushPage(pageLocation: PageLocation) {
         logger.info { "Flushing page $pageLocation" }
-        val pageId = pageTable[pageLocation]!!
+        val pageId = pageTableRwLock.withReadLock { pageTable[pageLocation] }!!
         if (isDirty[pageId]) {
             DiskManager.writePage(pageLocation, pages[pageId])
             isDirty[pageId] = false
@@ -240,7 +282,9 @@ class BufferPool : IBufferPool {
 
     override fun flushAllPages(dbId: Int) {
         logger.info { "Flushing all pages for dbId $dbId" }
-        pageTable.keys.filter { it.dbId == dbId }.forEach { flushPage(it) }
+        pageTableRwLock.withWriteLock {
+            pageTable.keys.filter { it.dbId == dbId }.forEach { flushPage(it) }
+        }
     }
 }
 
