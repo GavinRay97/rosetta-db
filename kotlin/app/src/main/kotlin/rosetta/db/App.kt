@@ -15,6 +15,8 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.experimental.and
+import kotlin.experimental.or
 
 const val PAGE_SIZE = 4096
 const val BUFFER_POOL_PAGES = 1000
@@ -238,6 +240,19 @@ interface IBufferPool {
     fun unpinPage(pageLocation: PageLocation, isDirty: Boolean)
     fun flushPage(pageLocation: PageLocation)
     fun flushAllPages(dbId: Int)
+
+    // Run an action using a page from the buffer pool. Calls "fetchPage" and "unpinPage" automatically
+    // The "isDirty" flag is passed to "unpinPage" with the boolean returned by the action
+    fun <T> withPage(pageLocation: PageLocation, action: (MemorySegment) -> Pair<T, Boolean>): T {
+        fetchPage(pageLocation)
+        val (result, isDirty) = action(fetchPage(pageLocation))
+        unpinPage(pageLocation, isDirty)
+        return result
+    }
+
+    fun <T> withPage(pageLocation: PageLocation, willDirty: Boolean = false, action: (MemorySegment) -> T): T {
+        return withPage(pageLocation) { page -> Pair(action(page), willDirty) }
+    }
 }
 
 fun <T> ReentrantReadWriteLock.withReadLock(action: () -> T): T {
@@ -559,8 +574,8 @@ class HeapFile(
         bufferPool.flushAllPages(dbId = tableLocation.dbId)
     }
 
-    fun <T> scan(
-        callback: (RecordId, MemorySegment) -> T,
+    fun scan(
+        callback: (RecordId, MemorySegment) -> Unit,
     ) {
         logger.info { "Scanning table $tableLocation with total pages: $numPages" }
         for (pageId in 0 until numPages + 1) {
@@ -579,6 +594,60 @@ class HeapFile(
         }
     }
 }
+
+// Free Space Map Page
+// The free space map page is a special page that keeps track of the free space in each page of the table
+// It is stored as a bitmap, where each 4-bit nibble represents the fullness of a single page
+// The first nibble represents the first page, the second nibble represents the second page, etc.
+// The free space is encoded in log2 scale, so 0 means the page is full, 1 means the page is half full, etc.
+object FreeSpaceMapPage {
+    const val PAGE_SIZE = 4096
+    const val NUM_PAGE_ENTRIES_PER_PAGE = 2 * PAGE_SIZE // 2 per byte, 4096 bytes per page
+
+    fun getFreeSpace(page: MemorySegment, pageId: Int): Int {
+        val byteIndex = pageId / 2
+        val nibbleIndex = pageId % 2
+        val byte = page.get(ValueLayout.JAVA_BYTE, byteIndex.toLong())
+        val nibble = if (nibbleIndex == 0) {
+            byte and 0x0F // Mask out the first nibble
+        } else {
+            // Shift right by 4 bits to get the second nibble
+            byte.toInt() shr 4 and 0x0F
+        }
+        return 1 shl nibble.toInt()
+    }
+
+    fun setFreeSpace(page: MemorySegment, pageId: Int, freeSpace: Int) {
+        val byteIndex = pageId / 2
+        val nibbleIndex = pageId % 2
+        val byte = page.get(ValueLayout.JAVA_BYTE, byteIndex.toLong())
+        val nibble = (Math.log(freeSpace.toDouble()) / Math.log(2.0)).toInt()
+        val newByte = if (nibbleIndex == 0) {
+            // Set the first nibble
+            byte and 0xF0.toByte() or nibble.toByte()
+        } else {
+            // Set the second nibble
+            byte and 0x0F or (nibble shl 4).toByte()
+        }
+        page.set(ValueLayout.JAVA_BYTE, byteIndex.toLong(), newByte)
+    }
+}
+
+fun freeSpaceMapTest() {
+    val page = MemorySegment.allocateNative(4096, MemorySession.global())
+    FreeSpaceMapPage.setFreeSpace(page, 0, 1)
+    FreeSpaceMapPage.setFreeSpace(page, 1, 2)
+
+    println("FreeSpaceMapPage.getFreeSpace(page, 0) = " + FreeSpaceMapPage.getFreeSpace(page, 0))
+    println("FreeSpaceMapPage.getFreeSpace(page, 1) = " + FreeSpaceMapPage.getFreeSpace(page, 1))
+
+    // Try to set an invalid free space value
+    FreeSpaceMapPage.setFreeSpace(page, 0, 9)
+    // Assert it was only set to the max value
+    println("FreeSpaceMapPage.getFreeSpace(page, 0) = " + FreeSpaceMapPage.getFreeSpace(page, 0))
+    assert(FreeSpaceMapPage.getFreeSpace(page, 0) == 8)
+}
+
 
 fun bufferPoolTest() {
     val bufferPool = BufferPool(diskManager = DiskManager, evictionPolicy = ClockEvictionPolicy())
@@ -644,6 +713,5 @@ fun heapFileTest() {
 
 fun main() {
     heapFileTest()
+    freeSpaceMapTest()
 }
-
-
