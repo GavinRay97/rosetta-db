@@ -6,9 +6,12 @@ package rosetta.db
 import com.sun.nio.file.ExtendedOpenOption
 import mu.KotlinLogging
 import java.io.File
+import java.lang.foreign.MemoryLayout
+import java.lang.foreign.MemoryLayout.PathElement
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.MemorySession
 import java.lang.foreign.ValueLayout
+import java.lang.invoke.VarHandle
 import java.nio.channels.FileChannel
 import java.nio.file.OpenOption
 import java.nio.file.Path
@@ -490,6 +493,115 @@ object HeapPage {
     }
 }
 
+
+object HeapPage2 {
+    private val logger = KotlinLogging.logger {}
+    private const val DELETED_RECORD_FLAG = 0x8000.toShort()
+
+    val PAGE_LAYOUT = MemoryLayout.structLayout(
+        Constants.JAVA_INT_UNALIGNED.withName("LSN"),
+        Constants.JAVA_INT_UNALIGNED.withName("pageId"),
+        Constants.JAVA_SHORT_UNALIGNED.withName("numSlots"),
+        Constants.JAVA_SHORT_UNALIGNED.withName("freeSpace"),
+        Constants.JAVA_INT_UNALIGNED.withName("reserved"),
+        MemoryLayout.sequenceLayout(
+            4096 / 8, MemoryLayout.structLayout(
+                Constants.JAVA_SHORT_UNALIGNED.withName("offset"),
+                Constants.JAVA_SHORT_UNALIGNED.withName("length"),
+            )
+        ).withName("slots")
+    )
+
+    val LSN_VH: VarHandle = PAGE_LAYOUT.varHandle(PathElement.groupElement("LSN"))
+    val PAGE_ID_VH = PAGE_LAYOUT.varHandle(PathElement.groupElement("pageId"))
+    val NUM_SLOTS_VH = PAGE_LAYOUT.varHandle(PathElement.groupElement("numSlots"))
+    val FREE_SPACE_VH = PAGE_LAYOUT.varHandle(PathElement.groupElement("freeSpace"))
+
+    val SLOT_OFFSET_VH = PAGE_LAYOUT.varHandle(
+        PathElement.groupElement("slots"),
+        PathElement.sequenceElement(),
+        PathElement.groupElement("offset")
+    )
+    val SLOT_LENGTH_VH = PAGE_LAYOUT.varHandle(
+        PathElement.groupElement("slots"),
+        PathElement.sequenceElement(),
+        PathElement.groupElement("length")
+    )
+
+    fun getLSN(page: MemorySegment): Long = LSN_VH.get(page) as Long
+    fun setLSN(page: MemorySegment, lsn: Long): Unit = LSN_VH.set(page, lsn.toInt())
+
+    fun getPageId(page: MemorySegment): Int = PAGE_ID_VH.get(page) as Int
+    fun setPageId(page: MemorySegment, pageId: Int) = PAGE_ID_VH.set(page, pageId)
+
+    fun getNumSlots(page: MemorySegment): Short = NUM_SLOTS_VH.get(page) as Short
+    fun setNumSlots(page: MemorySegment, numSlots: Short) = NUM_SLOTS_VH.set(page, numSlots)
+
+    fun getFreeSpace(page: MemorySegment): Short = FREE_SPACE_VH.get(page) as Short
+    fun setFreeSpace(page: MemorySegment, freeSpace: Short) = FREE_SPACE_VH.set(page, freeSpace)
+
+    fun getSlotOffset(page: MemorySegment, slotId: Int): Short = SLOT_OFFSET_VH.get(page, slotId) as Short
+    fun setSlotOffset(page: MemorySegment, slotId: Short, offset: Short) = SLOT_OFFSET_VH.set(page, slotId, offset)
+
+    fun getSlotLength(page: MemorySegment, slotId: Int): Short = SLOT_LENGTH_VH.get(page, slotId) as Short
+    fun setSlotLength(page: MemorySegment, slotId: Short, length: Short) = SLOT_LENGTH_VH.set(page, slotId, length)
+
+    fun getTuple(page: MemorySegment, slotId: Int): MemorySegment {
+        val offset = getSlotOffset(page, slotId)
+        val length = getSlotLength(page, slotId)
+        return page.asSlice(offset.toLong(), length.toLong())
+    }
+
+    fun insertTuple(page: MemorySegment, tuple: MemorySegment): RecordId {
+        logger.info {
+            "Inserting tuple: [page id=${getPageId(page)}, tuple size=${tuple.byteSize()}, " +
+                    "free space=${getFreeSpace(page)}, num slots=${getNumSlots(page)}]"
+        }
+
+        val numSlots = getNumSlots(page)
+        val freeSpace = getFreeSpace(page)
+        val tupleSize = tuple.byteSize()
+        if (tupleSize > freeSpace) {
+            throw IllegalArgumentException("Not enough space")
+        }
+        // Copy the tuple to the page
+        val offset = freeSpace - tupleSize
+        MemorySegment.copy(tuple, 0, page, offset, tupleSize)
+        // Update the page header
+        setSlotOffset(page, numSlots, offset.toShort())
+        setSlotLength(page, numSlots, tupleSize.toShort())
+        setNumSlots(page, (numSlots + 1).toShort())
+        setFreeSpace(page, (freeSpace - tupleSize).toShort())
+        return RecordId(getPageId(page), numSlots.toInt())
+    }
+
+    fun deleteTuple(page: MemorySegment, slotId: Short) {
+        val freeSpace = getFreeSpace(page)
+        val length = getSlotLength(page, slotId.toInt())
+        // Update the page header
+        setSlotOffset(page, slotId, DELETED_RECORD_FLAG)
+        setSlotLength(page, slotId, 0)
+        setFreeSpace(page, (freeSpace + length).toShort())
+        // We clean up deleted tuples lazily, so we don't need to do anything here
+    }
+
+    fun isDeleted(page: MemorySegment, slotId: Short): Boolean {
+        return getSlotOffset(page, slotId.toInt()) == DELETED_RECORD_FLAG
+    }
+
+    fun getRecordId(page: MemorySegment, slotId: Int): RecordId {
+        return RecordId(getPageId(page), slotId)
+    }
+
+    fun initializeEmptyPage(page: MemorySegment, pageId: Int) {
+        setLSN(page, 0)
+        setPageId(page, pageId)
+        setNumSlots(page, 0)
+        setFreeSpace(page, PAGE_SIZE.toShort())
+    }
+}
+
+
 class HeapFile(
     val bufferPool: IBufferPool,
     val diskManager: IDiskManager,
@@ -508,7 +620,7 @@ class HeapFile(
             logger.info { "Table $tableLocation is empty, creating a new page" }
             val location = getPageLocation(0)
             val page = bufferPool.fetchPage(location)
-            HeapPage.initializeEmptyPage(page, 0)
+            HeapPage2.initializeEmptyPage(page, 0)
             bufferPool.unpinPage(location, true)
         }
     }
@@ -528,7 +640,7 @@ class HeapFile(
     fun getFreeSpace(pageId: Int): Int {
         val location = getPageLocation(pageId)
         val page = bufferPool.fetchPage(location)
-        val freeSpace = HeapPage.getFreeSpace(page)
+        val freeSpace = HeapPage2.getFreeSpace(page)
         bufferPool.unpinPage(location, false)
         return freeSpace.toInt()
     }
@@ -536,7 +648,7 @@ class HeapFile(
     fun getTuple(recordId: RecordId): MemorySegment {
         val location = getPageLocation(recordId.pageId)
         val page = bufferPool.fetchPage(location)
-        val tuple = HeapPage.getTuple(page, recordId.slotId)
+        val tuple = HeapPage2.getTuple(page, recordId.slotId)
         bufferPool.unpinPage(location, false)
         return tuple
     }
@@ -548,7 +660,7 @@ class HeapFile(
         // Try to insert the tuple into the page
         // Catching the exception means that the page is full, so we need to create a new page
         return try {
-            val recordId = HeapPage.insertTuple(page, tuple)
+            val recordId = HeapPage2.insertTuple(page, tuple)
             bufferPool.unpinPage(location, isDirty = true)
             recordId
         } catch (e: IllegalArgumentException) {
@@ -556,7 +668,7 @@ class HeapFile(
             logger.info { "Page $location is full, creating a new page" }
             val newLocation = getPageLocation(numPages)
             val newPage = bufferPool.fetchPage(newLocation)
-            HeapPage.initializeEmptyPage(newPage, numPages)
+            HeapPage2.initializeEmptyPage(newPage, numPages)
             bufferPool.unpinPage(newLocation, isDirty = true)
             numPages++
             insertTuple(tuple)
@@ -566,7 +678,7 @@ class HeapFile(
     fun deleteTuple(recordId: RecordId) {
         val location = getPageLocation(recordId.pageId)
         val page = bufferPool.fetchPage(location)
-        HeapPage.deleteTuple(page, recordId.slotId.toShort())
+        HeapPage2.deleteTuple(page, recordId.slotId.toShort())
         bufferPool.unpinPage(location, isDirty = true)
     }
 
@@ -582,11 +694,11 @@ class HeapFile(
             logger.info { "Scanning page $pageId" }
             val location = getPageLocation(pageId)
             val page = bufferPool.fetchPage(location)
-            val numSlots = HeapPage.getNumSlots(page)
+            val numSlots = HeapPage2.getNumSlots(page)
             for (slotId in 0 until numSlots) {
-                if (!HeapPage.isDeleted(page, slotId.toShort())) {
-                    val recordId = HeapPage.getRecordId(page, slotId)
-                    val tuple = HeapPage.getTuple(page, slotId)
+                if (!HeapPage2.isDeleted(page, slotId.toShort())) {
+                    val recordId = HeapPage2.getRecordId(page, slotId)
+                    val tuple = HeapPage2.getTuple(page, slotId)
                     callback(recordId, tuple)
                 }
             }
@@ -669,17 +781,17 @@ fun heapPageTest() {
 
     val page = bufferPool.fetchPage(pageLocation)
     // Initialize the Heap Page free space
-    HeapPage.setFreeSpace(page, PAGE_SIZE.toShort())
+    HeapPage2.setFreeSpace(page, PAGE_SIZE.toShort())
 
     // Insert a tuple
     val tuple = MemorySegment.allocateNative(4, MemorySession.global())
     tuple.asByteBuffer().putInt(0, 42)
-    val recordId = HeapPage.insertTuple(page, tuple)
+    val recordId = HeapPage2.insertTuple(page, tuple)
     bufferPool.unpinPage(pageLocation, true)
 
     // Get the tuple
     val page3 = bufferPool.fetchPage(pageLocation)
-    val tuple2 = HeapPage.getTuple(page3, recordId.slotId)
+    val tuple2 = HeapPage2.getTuple(page3, recordId.slotId)
     println("Got tuple: ${tuple2.asByteBuffer().int}")
 }
 
@@ -705,7 +817,8 @@ fun heapFileTest() {
 
     // Scan the HeapFile
     heapFile.scan { recordId, tuple ->
-        println("Scanned tuple: ${tuple.asByteBuffer().int}")
+        val bb = tuple.asByteBuffer()
+        println("Scanned tuple: ${bb.int}")
     }
 
     heapFile.flushAllPages()
